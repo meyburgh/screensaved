@@ -23,4 +23,9 @@ void SetStartWithWindows(bool enable);
 // Check if startup registration currently exists
 bool IsStartWithWindowsEnabled();
 
+// Verify the startup registry entry points to the current exe path.
+// If startWithWindows is true and the entry is missing or stale, re-register.
+// If startWithWindows is false and the entry exists, remove it.
+void VerifyStartupRegistration(bool startWithWindows);
+
 } // namespace ConfigStore

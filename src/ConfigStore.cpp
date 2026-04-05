@@ -157,4 +157,52 @@ bool IsStartWithWindowsEnabled() {
     return (result == ERROR_SUCCESS && type == REG_SZ);
 }
 
+void VerifyStartupRegistration(bool startWithWindows) {
+    HKEY hKey = nullptr;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0,
+                                KEY_QUERY_VALUE | KEY_SET_VALUE, &hKey);
+    if (result != ERROR_SUCCESS) {
+        if (startWithWindows) {
+            Logger::Warn("Cannot open Run key for verification, re-registering");
+            SetStartWithWindows(true);
+        }
+        return;
+    }
+
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+    wchar_t regValue[MAX_PATH] = {};
+    DWORD type = 0;
+    DWORD size = sizeof(regValue);
+    result = RegQueryValueExW(hKey, kRunValueName, nullptr, &type,
+                              reinterpret_cast<BYTE*>(regValue), &size);
+
+    bool entryExists = (result == ERROR_SUCCESS && type == REG_SZ);
+    bool pathMatches = entryExists && (_wcsicmp(regValue, exePath) == 0);
+
+    if (startWithWindows) {
+        if (!entryExists) {
+            Logger::Warn("Startup registry entry missing, re-registering: %ls", exePath);
+            RegSetValueExW(hKey, kRunValueName, 0, REG_SZ,
+                           reinterpret_cast<const BYTE*>(exePath),
+                           static_cast<DWORD>((wcslen(exePath) + 1) * sizeof(wchar_t)));
+        } else if (!pathMatches) {
+            Logger::Warn("Startup registry path stale (%ls), updating to: %ls", regValue, exePath);
+            RegSetValueExW(hKey, kRunValueName, 0, REG_SZ,
+                           reinterpret_cast<const BYTE*>(exePath),
+                           static_cast<DWORD>((wcslen(exePath) + 1) * sizeof(wchar_t)));
+        } else {
+            Logger::Info("Startup registration verified: %ls", exePath);
+        }
+    } else {
+        if (entryExists) {
+            Logger::Warn("Startup registry entry exists but startWithWindows is off, removing");
+            RegDeleteValueW(hKey, kRunValueName);
+        }
+    }
+
+    RegCloseKey(hKey);
+}
+
 } // namespace ConfigStore

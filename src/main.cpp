@@ -13,6 +13,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // Load configuration from AppData
     AppConfig config = ConfigStore::Load();
 
+    // Verify startup registration matches current exe path
+    ConfigStore::VerifyStartupRegistration(config.startWithWindows);
+
     // Create monitor manager
     MonitorManager monitorMgr;
     monitorMgr.SetConfig(config);
@@ -86,6 +89,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     // Shutdown
     Logger::Info("Shutting down...");
+
+    // Verify startup registration before exiting
+    AppConfig finalConfig = monitorMgr.GetConfig();
+    ConfigStore::VerifyStartupRegistration(finalConfig.startWithWindows);
+
     inputHook.Stop();
     monitorMgr.Shutdown();
     tray.Shutdown();

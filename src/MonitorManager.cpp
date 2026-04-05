@@ -93,12 +93,14 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM dwData) 
 
         ctx->monitors->push_back(mon);
 
-        Logger::Info("Discovered monitor: %ls bounds=(%ld,%ld)-(%ld,%ld) ddc=%d contrast=%d brightness=%lu contrast=%lu",
+        Logger::Info("Discovered monitor: %ls bounds=(%ld,%ld)-(%ld,%ld) ddc=%d contrast=%d "
+                     "brightness=%lu/%lu-%lu contrast=%lu/%lu-%lu (saved as original)",
                      mi.szDevice,
                      mi.rcMonitor.left, mi.rcMonitor.top,
                      mi.rcMonitor.right, mi.rcMonitor.bottom,
                      mon.ddcSupported ? 1 : 0, mon.contrastSupported ? 1 : 0,
-                     mon.currentBrightness, mon.currentContrast);
+                     mon.currentBrightness, mon.brightnessMin, mon.brightnessMax,
+                     mon.currentContrast, mon.contrastMin, mon.contrastMax);
 
         break; // Only use first physical monitor per logical monitor
     }
@@ -191,11 +193,35 @@ void MonitorManager::SetEnabled(bool enabled) {
     Logger::Info("Application %s", enabled ? "enabled" : "disabled");
 
     if (!enabled && wasEnabled) {
+        // Restore all monitors to their original brightness/contrast
         for (auto& mon : m_monitors) {
-            mon.targetBrightness = mon.normalBrightness;
-            mon.targetContrast   = mon.normalContrast;
             mon.fadeState = FadeState::Idle;
             mon.isActive = false;
+            mon.targetBrightness = mon.originalBrightness;
+            mon.targetContrast   = mon.originalContrast;
+
+            // Immediately write original values via DDC/CI
+            if (mon.hPhysical) {
+                if (mon.ddcSupported) {
+                    if (DdcInterface::SetBrightness(mon.hPhysical, mon.originalBrightness))
+                        mon.currentBrightness = mon.originalBrightness;
+                }
+                if (mon.contrastSupported) {
+                    if (DdcInterface::SetContrast(mon.hPhysical, mon.originalContrast))
+                        mon.currentContrast = mon.originalContrast;
+                }
+            }
+
+            // Hide software overlay
+            if (mon.useSoftwareFallback) {
+                for (auto& ov : m_overlays) {
+                    if (ov.hMonitor == mon.hLogical && ov.hwnd)
+                        ShowWindow(ov.hwnd, SW_HIDE);
+                }
+            }
+
+            Logger::Info("Restored monitor %ls to original brightness=%lu contrast=%lu",
+                         mon.deviceName.c_str(), mon.originalBrightness, mon.originalContrast);
         }
     }
 
@@ -249,6 +275,8 @@ void MonitorManager::Shutdown() {
                 DdcInterface::SetBrightness(mon.hPhysical, mon.originalBrightness);
             if (mon.contrastSupported)
                 DdcInterface::SetContrast(mon.hPhysical, mon.originalContrast);
+            Logger::Info("Restored monitor %ls to original brightness=%lu contrast=%lu on exit",
+                         mon.deviceName.c_str(), mon.originalBrightness, mon.originalContrast);
         }
     }
 
