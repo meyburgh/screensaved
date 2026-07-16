@@ -15,6 +15,8 @@ public:
     using ExitCallback     = std::function<void()>;
     using SettingsCallback = std::function<void(const AppConfig&)>;
     using GetConfigCallback = std::function<AppConfig()>;
+    using DisplayWakeCallback   = std::function<void()>;
+    using DisplayChangeCallback = std::function<void()>;
 
     TrayUI();
     ~TrayUI();
@@ -24,7 +26,9 @@ public:
               ToggleCallback onToggle,
               ExitCallback onExit,
               SettingsCallback onSettingsSave,
-              GetConfigCallback getConfig);
+              GetConfigCallback getConfig,
+              DisplayWakeCallback onDisplayWake = nullptr,
+              DisplayChangeCallback onDisplayChange = nullptr);
 
     // Update the icon to reflect enabled/disabled state.
     void SetEnabled(bool enabled);
@@ -45,6 +49,7 @@ private:
     void CreateTrayIcons();
 
     static INT_PTR CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+    static bool PersistSettingsFromDialog(HWND hwnd);
 
     HWND            m_hwnd     = nullptr;
     HINSTANCE       m_hInst    = nullptr;
@@ -53,12 +58,15 @@ private:
     bool            m_enabled  = true;
     NOTIFYICONDATAW m_nid      = {};
 
-    ToggleCallback    m_onToggle;
-    ExitCallback      m_onExit;
-    SettingsCallback  m_onSettingsSave;
-    GetConfigCallback m_getConfig;
+    ToggleCallback        m_onToggle;
+    ExitCallback          m_onExit;
+    SettingsCallback      m_onSettingsSave;
+    GetConfigCallback     m_getConfig;
+    DisplayWakeCallback   m_onDisplayWake;
+    DisplayChangeCallback m_onDisplayChange;
 
     HWND              m_settingsDlg = nullptr;
+    HPOWERNOTIFY      m_powerNotify = nullptr;
 
     static TrayUI* s_instance;
 };

@@ -39,9 +39,17 @@ The application discovers all connected desktop monitors, maps logical monitors 
 - The previously active monitor starts or resets an idle timer.
 - When a monitor remains inactive longer than the configured timeout, which defaults to `15 seconds`, it begins fading brightness and contrast toward idle targets using a logarithmic falloff curve.
 
+The monitor that currently holds the cursor also fades once the mouse has been stationary for a configurable number of minutes, defaulting to `5 minutes`. Any mouse movement, button press, or wheel input restores the faded active monitor and restarts the idle countdown.
+
+Keyboard activity counts as activity on the monitor that hosts the focused (foreground) window: it postpones fading on that monitor, reverses a fade that has already started there, and — when the focused window sits on the cursor's monitor — also restarts the mouse-idle countdown.
+
+Fading is suppressed on any monitor that is playing full-screen media. A monitor counts as playing full-screen media when a visible top-level window covers its entire bounds while an application is holding the display awake (`ES_DISPLAY_REQUIRED`), which media players and browsers set during playback. If a fade is already in progress or complete when full-screen media is detected, the monitor is restored to its normal targets.
+
 Brightness and contrast changes are not written directly from the input path. Instead, the application updates target setpoints and a dedicated worker thread performs throttled DDC/CI writes.
 
 By default, the dim target is `5%` of the monitor's usual brightness and `5%` of the monitor's usual contrast, but brightness fade settings and contrast fade settings must be configurable separately.
+
+Each monitor also has configurable normal maximum ceiling values for brightness and contrast. When a monitor is restored from dimmed or idle state, the application should restore toward these saved ceiling values rather than assuming the current hardware value at process startup is the desired normal target.
 
 ## Architecture
 
@@ -69,6 +77,7 @@ The settings dialog presented from the tray UI must include a branded header rea
 Responsibilities:
 
 - Install a low-level global mouse hook with `SetWindowsHookEx(WH_MOUSE_LL, ...)`.
+- Install a low-level global keyboard hook with `SetWindowsHookEx(WH_KEYBOARD_LL, ...)` and attribute key presses to the monitor hosting the foreground window.
 - Process mouse move events.
 - Resolve the current logical monitor using `MonitorFromPoint`.
 - Detect transitions between monitors.
@@ -116,7 +125,7 @@ Key requirements:
 
 - Distinguish between logical monitors (`HMONITOR`) and physical monitors (`PHYSICAL_MONITOR` / monitor handles used by DDC/CI).
 - Capture each monitor's screen bounds for hit testing and mouse-to-monitor mapping.
-- Query and cache original brightness and contrast when supported.
+- Query and cache current brightness and contrast when supported.
 - Clean up all physical monitor handles during shutdown or rediscovery.
 - Support safe runtime re-enumeration when monitor count, bounds, or monitor mapping changes.
 
@@ -228,13 +237,17 @@ This design prevents command storms and keeps the application responsive.
 The application should expose at least the following configurable values:
 
 - Idle timeout before fade-out starts
+- Mouse idle fade timeout for the active monitor, in minutes, defaulting to `5` (`0` disables the feature)
 - Fade-in duration, defaulting to `100ms`
 - Minimum brightness floor, defaulting to `5%` of usual brightness
 - Minimum contrast floor, defaulting to `5%` of usual contrast
+- Maximum brightness ceiling, defaulting to the monitor's detected normal brightness on first configuration
+- Maximum contrast ceiling, defaulting to the monitor's detected normal contrast on first configuration
 - Usual or normal brightness and contrast targets per monitor, if the application supports persistent monitor-specific preferences
 - Global enabled or disabled state
 
 Configuration changes should be applied without requiring application restart where practical.
+When floor or ceiling values are changed, the running monitor targets and current physical display values must be reconciled with the new bounds. Any supported monitor currently below its configured floor should be raised to that floor, and any supported monitor currently above its configured ceiling should be lowered to that ceiling through the normal throttled worker path.
 
 ### Persistence
 
@@ -243,12 +256,15 @@ User configuration must be stored per user in the Windows AppData folder.
 Requirements:
 
 - Load the user's saved configuration on startup.
-- Save updated settings when the user confirms changes in the settings dialog.
+- Save updated settings when the user confirms changes in the settings dialog or closes the settings window.
 - Create the configuration file with application defaults if it does not yet exist.
 - Fall back to defaults if the persisted configuration is unreadable or invalid.
 - Log configuration load and save failures.
 - Persist the user's startup-at-logon preference.
 - Persist periodic validation preferences if the feature is made user-configurable.
+- Persist each monitor's brightness and contrast ceiling values.
+- When the application observes or applies a user-requested brightness or contrast value above the saved ceiling for that monitor, update the saved ceiling to the new higher value.
+- When the application starts automatically at user logon, set each controllable monitor's brightness and contrast to its previously saved ceiling values after monitor discovery and configuration load.
 
 The exact storage format may be JSON, INI, or another simple structured format, but it must be easy to inspect and stable across launches.
 
@@ -265,12 +281,12 @@ Illustrative monitor representation:
 struct MonitorDevice {
     HANDLE hPhysical;
     RECT bounds;
-    DWORD originalBrightness;
     DWORD normalBrightness;
+    DWORD ceilingBrightness;
     DWORD targetBrightness;
     DWORD currentBrightness;
-    DWORD originalContrast;
     DWORD normalContrast;
+    DWORD ceilingContrast;
     DWORD targetContrast;
     DWORD currentContrast;
     bool isDimmed;
@@ -287,6 +303,7 @@ Recommended additions for production use:
 - Support/availability flags for DDC/CI
 - Brightness min/max range
 - Contrast min/max range
+- Persisted brightness and contrast ceiling targets
 - Last command timestamp
 - Failure count
 - Idle deadline or timer state
@@ -371,13 +388,19 @@ Additional guidance:
 - The dialog must display the application's configurable values.
 - The dialog controls must initialize from the user's persisted settings.
 - Confirming the dialog must update the running configuration and persist the values for future launches.
+- The dialog must prevent saving a brightness or contrast floor that is greater than its corresponding ceiling.
+- Closing the settings window must persist the active settings values so the next application launch restores the values from the previous run.
+- Whenever the settings window is closed, the application must immediately check every supported monitor's current brightness and contrast against the active floor and ceiling values and queue any needed adjustments through the normal worker path.
 
 Minimum settings surface:
 
 - Idle timeout
+- Mouse idle fade timeout (minutes, `0` = off)
 - Fade-in duration
 - Minimum brightness floor
 - Minimum contrast floor
+- Maximum brightness ceiling
+- Maximum contrast ceiling
 - Brightness fade configuration
 - Contrast fade configuration
 - Application enabled or disabled state
@@ -395,7 +418,7 @@ Minimum menu items:
 Behavior:
 
 - Selecting `Settings` opens the settings dialog.
-- Selecting `Exit` closes the application cleanly.
+- Selecting `Exit` sets supported displays to their saved ceiling brightness and contrast values, then closes the application cleanly.
 - Double-click remains the shortcut for enable or disable toggling.
 
 ## Startup Integration Requirements
@@ -484,12 +507,18 @@ Mitigation:
 - Track mouse monitor transitions using a low-level mouse hook.
 - Periodically validate cursor-to-monitor mapping and monitor dimensions as a recovery mechanism.
 - Restore the active monitor and dim inactive monitors only after a configurable idle timeout.
+- Fade the active monitor after a configurable number of minutes without mouse movement, defaulting to `5 minutes`, and restore it on the next mouse activity.
+- Treat keyboard activity as activity on the monitor that hosts the focused window: postpone or reverse fading there, and reset the mouse-idle countdown when that monitor is the active one.
+- Suppress fading on any monitor covered by a full-screen window while an application holds the display awake (full-screen media playback), and restore such a monitor if a fade already began.
 - Use a default fade-in duration of `100ms` when restoring the active monitor.
 - Apply a logarithmic fade-out curve for brightness and contrast after timeout expiry.
 - Respect separate configurable fade settings for brightness and contrast, including minimum floors with defaults of `5%`.
+- Respect separate configurable maximum ceilings for brightness and contrast, and restore monitors toward those ceilings when returning from dimmed or idle state.
+- When floor or ceiling settings change, update affected monitor targets so current brightness and contrast are brought within the new bounds without requiring restart.
+- Detect user-requested brightness or contrast increases above a saved ceiling and persist the new higher value as the monitor's ceiling.
+- On automatic startup at user logon, restore controllable monitors to their previously saved brightness and contrast ceiling values.
 - Throttle brightness and contrast writes to protect monitor firmware and preserve responsiveness.
-- Restore or preserve original brightness values as defined by configuration or shutdown policy.
-- Restore or preserve original contrast values as defined by configuration or shutdown policy.
+- On application exit, set supported displays to their saved brightness and contrast ceiling values rather than restoring the brightness or contrast values observed when the process started.
 - Continue operating when one or more monitors do not support DDC/CI.
 - Toggle the application enabled state via tray icon double-click.
 - Change the tray icon visual state to indicate whether the application is enabled or disabled.
@@ -516,10 +545,19 @@ Mitigation:
 - Moving the mouse between monitors causes the newly active monitor to begin restoring brightness and contrast without freezing the tray UI.
 - Inactive monitors do not begin fading until the configured idle timeout has elapsed.
 - The idle timeout defaults to `15 seconds` and can be changed through settings.
+- The monitor holding the cursor fades after the configured mouse idle timeout, which defaults to `5 minutes`, can be changed through settings, and is disabled by setting it to `0`.
+- Moving the mouse after the active monitor has faded restores it toward its normal targets.
+- Typing while the focused window is on a monitor prevents that monitor from fading and restores it if a fade already started; a monitor restored this way resumes its idle countdown once keyboard activity stops.
+- A monitor playing full-screen media (full-screen window plus an application holding the display awake) does not fade, and an in-progress or completed fade on such a monitor is reversed.
 - Once the timeout expires, inactive monitors fade brightness and contrast down using a logarithmic falloff instead of a linear step pattern.
 - Fade-in defaults to `100ms` and can be changed through settings.
 - Brightness fade settings and contrast fade settings are exposed separately in the settings dialog.
 - The minimum brightness floor defaults to `5%` of usual brightness and the minimum contrast floor defaults to `5%` of usual contrast, and both can be changed independently.
+- The maximum brightness ceiling and maximum contrast ceiling are exposed in the settings dialog and can be changed independently.
+- Closing the settings window immediately checks every supported monitor and adjusts any current brightness or contrast value outside the active floor and ceiling bounds into range.
+- Increasing brightness or contrast above the saved ceiling updates the persisted ceiling for that monitor.
+- When the app starts automatically at user logon, it applies the previously saved brightness and contrast ceiling values to supported monitors.
+- When the application exits, it sets supported displays to their saved brightness and contrast ceiling values instead of restoring startup brightness or contrast values.
 - Rapid mouse movement across screens does not produce a burst of unbounded DDC/CI commands.
 - If the mouse hook misses a transition, the periodic validation pass corrects the active-monitor state within its configured interval.
 - If monitor layout changes at runtime, the app re-detects monitor dimensions and continues tracking the correct screens.
@@ -531,7 +569,7 @@ Mitigation:
 - The settings dialog displays the configurable values and initializes from the user's last saved choices.
 - The settings dialog includes a startup checkbox and preserves the user's startup preference across launches.
 - When the app starts and startup is not already enabled, the user is prompted to enable run-at-login for the current user.
-- Confirming changes in the settings dialog persists them to the current user's AppData folder and restores them on next launch.
+- Confirming changes in the settings dialog or closing the settings window persists the active values to the current user's AppData folder and restores them on next launch.
 - Unsupported monitors are detected and reported without crashing the application.
 - Closing the application releases monitor handles, hooks, timers, and worker resources cleanly.
 

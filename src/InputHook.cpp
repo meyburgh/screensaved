@@ -35,14 +35,52 @@ void InputHook::Stop() {
 }
 
 LRESULT CALLBACK InputHook::MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && s_instance && wParam == WM_MOUSEMOVE) {
+    if (nCode >= 0 && s_instance) {
         auto* mhs = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
         POINT pt = mhs->pt;
 
-        HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        if (hMon != s_instance->m_lastMonitor) {
-            s_instance->m_lastMonitor = hMon;
-            s_instance->m_manager.OnMonitorActivated(hMon);
+        if (wParam == WM_MOUSEMOVE) {
+            // Windows re-posts WM_MOUSEMOVE without actual movement (e.g. on
+            // window redraws) — only count position changes as activity.
+            if (pt.x != s_instance->m_lastPoint.x || pt.y != s_instance->m_lastPoint.y) {
+                s_instance->m_lastPoint = pt;
+                s_instance->m_manager.OnMouseActivity();
+
+                HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                if (hMon != s_instance->m_lastMonitor) {
+                    s_instance->m_lastMonitor = hMon;
+                    s_instance->m_manager.OnMonitorActivated(hMon);
+                }
+            }
+        } else if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
+                   wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN) {
+            s_instance->m_manager.OnMouseActivity();
+            HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            if (hMon) {
+                s_instance->m_lastMonitor = hMon;
+                s_instance->m_manager.OnMonitorClicked(hMon);
+            }
+        } else if (wParam == WM_MOUSEWHEEL || wParam == WM_MOUSEHWHEEL) {
+            s_instance->m_manager.OnMouseActivity();
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+LRESULT CALLBACK InputHook::KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && s_instance &&
+        (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        // Throttle: one report per 200ms is plenty, and keeps the low-level
+        // hook (which delays keystroke delivery system-wide) cheap.
+        ULONGLONG tick = GetTickCount64();
+        if (tick - s_instance->m_lastKeyboardTick >= 200) {
+            s_instance->m_lastKeyboardTick = tick;
+            // Keyboard input belongs to the monitor hosting the focused window.
+            HWND fg = GetForegroundWindow();
+            if (fg) {
+                HMONITOR hMon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+                if (hMon) s_instance->m_manager.OnKeyboardActivity(hMon);
+            }
         }
     }
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
@@ -61,6 +99,16 @@ void InputHook::ThreadFunc() {
 
     Logger::Info("Mouse hook installed");
 
+    // Install low-level keyboard hook (keyboard activity keeps the focused
+    // window's monitor awake). Non-fatal if it fails.
+    HHOOK kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc,
+                                     GetModuleHandleW(nullptr), 0);
+    if (kbHook) {
+        Logger::Info("Keyboard hook installed");
+    } else {
+        Logger::Error("Failed to install keyboard hook, error=%lu", GetLastError());
+    }
+
     // Message loop required for low-level hooks
     MSG msg;
     while (m_running) {
@@ -70,6 +118,10 @@ void InputHook::ThreadFunc() {
         DispatchMessageW(&msg);
     }
 
+    if (kbHook) {
+        UnhookWindowsHookEx(kbHook);
+        Logger::Info("Keyboard hook uninstalled");
+    }
     UnhookWindowsHookEx(hook);
     Logger::Info("Mouse hook uninstalled");
 }

@@ -2,8 +2,14 @@
 #include "DdcInterface.h"
 #include "Logger.h"
 
+#include <dwmapi.h>
+#include <powrprof.h>
+
 #include <cmath>
 #include <algorithm>
+
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "powrprof.lib")
 
 // ---------------------------------------------------------------------------
 // Overlay window class name
@@ -116,6 +122,7 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC, LPRECT, LPARAM dwData) 
 MonitorManager::MonitorManager() {
     m_workerWakeEvent = MakeScopedHandle(
         CreateEventW(nullptr, FALSE, FALSE, nullptr));
+    m_lastMouseActivityTick = GetTickCount64();
 }
 
 MonitorManager::~MonitorManager() {
@@ -151,6 +158,7 @@ void MonitorManager::OnMonitorActivated(HMONITOR hNewActive) {
     auto now = std::chrono::steady_clock::now();
     HMONITOR hPrev = m_activeMonitor;
     m_activeMonitor = hNewActive;
+    m_activeIdleFaded = false;
 
     for (auto& mon : m_monitors) {
         if (mon.hLogical == hNewActive) {
@@ -161,6 +169,10 @@ void MonitorManager::OnMonitorActivated(HMONITOR hNewActive) {
             mon.fadeStartTime = now;
             mon.fadeBrightnessAtStart = static_cast<double>(mon.currentBrightness);
             mon.fadeContrastAtStart    = static_cast<double>(mon.currentContrast);
+            // Why: if hardware drifted (DPMS wake, OSD, dropped DDC write) the
+            // cache may already equal normal so the worker would no-op. Force a
+            // write so the activated monitor always reaches the ceiling.
+            mon.forceWrite = true;
         } else if (mon.hLogical == hPrev) {
             mon.isActive = false;
             mon.fadeState = FadeState::Waiting;
@@ -170,6 +182,127 @@ void MonitorManager::OnMonitorActivated(HMONITOR hNewActive) {
 
     if (m_workerWakeEvent)
         SetEvent(m_workerWakeEvent.get());
+}
+
+void MonitorManager::OnMonitorClicked(HMONITOR hMon) {
+    if (!hMon) return;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_config.enabled) return;
+
+        auto now = std::chrono::steady_clock::now();
+
+        for (auto& mon : m_monitors) {
+            if (mon.hLogical != hMon) continue;
+
+            // A click is an explicit "make this bright now" gesture. Always
+            // queue a forced write — never trust the cached current values,
+            // because hardware can drift below the cache (DPMS wake, OSD
+            // adjustment, silently-dropped DDC write) and leave the monitor
+            // dim while we believe it's at the ceiling.
+            mon.fadeState = FadeState::Idle;
+            mon.isActive = true;
+            mon.targetBrightness = mon.normalBrightness;
+            mon.targetContrast   = mon.normalContrast;
+            mon.lastCommandTime = std::chrono::steady_clock::time_point{};
+            mon.forceWrite = true;
+
+            // If this click landed on a monitor that wasn't the tracked
+            // active one, treat it as an activation transition.
+            if (m_activeMonitor && m_activeMonitor != hMon) {
+                for (auto& prev : m_monitors) {
+                    if (prev.hLogical != m_activeMonitor) continue;
+                    prev.isActive = false;
+                    if (prev.fadeState == FadeState::Idle ||
+                        prev.fadeState == FadeState::FadingIn) {
+                        prev.fadeState = FadeState::Waiting;
+                        prev.idleStart = now;
+                    }
+                    break;
+                }
+            }
+            m_activeMonitor = hMon;
+            m_activeIdleFaded = false;
+
+            Logger::Info("Click on %ls — snapping to ceiling brightness=%lu contrast=%lu",
+                         mon.deviceName.c_str(),
+                         mon.normalBrightness, mon.normalContrast);
+            break;
+        }
+    }
+
+    if (m_workerWakeEvent) SetEvent(m_workerWakeEvent.get());
+}
+
+void MonitorManager::OnMouseActivity() {
+    m_lastMouseActivityTick.store(GetTickCount64(), std::memory_order_relaxed);
+
+    // Fast path: nothing faded by mouse-idle, so no lock needed. This runs on
+    // the low-level hook thread for every mouse move and must stay cheap.
+    if (!m_activeIdleFaded.load(std::memory_order_relaxed)) return;
+
+    bool woke = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_activeIdleFaded = false;
+        if (!m_config.enabled) return;
+
+        auto now = std::chrono::steady_clock::now();
+        for (auto& mon : m_monitors) {
+            if (!mon.isActive) continue;
+            if (mon.fadeState == FadeState::FadingOut ||
+                mon.fadeState == FadeState::Dimmed) {
+                mon.fadeState = FadeState::FadingIn;
+                mon.fadeStartTime = now;
+                mon.fadeBrightnessAtStart = static_cast<double>(mon.currentBrightness);
+                mon.fadeContrastAtStart    = static_cast<double>(mon.currentContrast);
+                mon.targetBrightness = mon.normalBrightness;
+                mon.targetContrast   = mon.normalContrast;
+                mon.forceWrite = true;
+                woke = true;
+                Logger::Info("Mouse activity — restoring idle-faded active monitor %ls",
+                             mon.deviceName.c_str());
+            }
+            break;
+        }
+    }
+
+    if (woke && m_workerWakeEvent) SetEvent(m_workerWakeEvent.get());
+}
+
+void MonitorManager::OnKeyboardActivity(HMONITOR hMon) {
+    // Runs on the low-level keyboard hook thread — atomic stores only, never
+    // take m_mutex here (the worker holds it across slow DDC writes and that
+    // would delay keystroke delivery system-wide). The worker picks these up
+    // on its next tick.
+    if (!hMon) return;
+    m_lastKeyboardMonitor.store(hMon, std::memory_order_relaxed);
+    m_lastKeyboardActivityTick.store(GetTickCount64(), std::memory_order_relaxed);
+}
+
+void MonitorManager::OnDisplayWake() {
+    Logger::Info("Display wake event — forcing reconcile on all monitors");
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // Force the next worker tick to validate topology in case monitor
+        // handles changed across the sleep/wake cycle.
+        m_lastTopologyCheck = std::chrono::steady_clock::time_point{};
+        for (auto& mon : m_monitors) {
+            mon.forceWrite = true;
+            mon.lastCommandTime = std::chrono::steady_clock::time_point{};
+        }
+    }
+    if (m_workerWakeEvent) SetEvent(m_workerWakeEvent.get());
+}
+
+void MonitorManager::OnDisplayChanged() {
+    Logger::Info("Display change event — scheduling topology validation");
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_lastTopologyCheck = std::chrono::steady_clock::time_point{};
+    }
+    if (m_workerWakeEvent) SetEvent(m_workerWakeEvent.get());
 }
 
 void MonitorManager::SetConfig(const AppConfig& cfg) {
@@ -193,6 +326,7 @@ void MonitorManager::SetEnabled(bool enabled) {
     Logger::Info("Application %s", enabled ? "enabled" : "disabled");
 
     if (!enabled && wasEnabled) {
+        m_activeIdleFaded = false;
         // Restore all monitors to their original brightness/contrast
         for (auto& mon : m_monitors) {
             mon.fadeState = FadeState::Idle;
@@ -246,6 +380,128 @@ void MonitorManager::RecomputeDimFloors(MonitorDevice& mon) {
     DWORD cFloor = mon.contrastMin +
         static_cast<DWORD>(cRange * m_config.dimContrastPercent / 100.0);
     mon.dimFloorContrast = std::clamp(cFloor, mon.contrastMin, mon.contrastMax);
+
+    // Brightness ceiling — used as the "normal" / restore target.
+    DWORD bCeil = mon.brightnessMin +
+        static_cast<DWORD>(bRange * m_config.maxBrightnessPercent / 100.0);
+    mon.normalBrightness = std::clamp(bCeil, mon.brightnessMin, mon.brightnessMax);
+
+    // Contrast ceiling
+    DWORD cCeil = mon.contrastMin +
+        static_cast<DWORD>(cRange * m_config.maxContrastPercent / 100.0);
+    mon.normalContrast = std::clamp(cCeil, mon.contrastMin, mon.contrastMax);
+}
+
+void MonitorManager::SetOnConfigChanged(ConfigSavedCallback cb) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_onConfigChanged = std::move(cb);
+}
+
+void MonitorManager::ApplyCeilings() {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& mon : m_monitors) {
+            RecomputeDimFloors(mon);
+            mon.targetBrightness  = mon.normalBrightness;
+            mon.targetContrast    = mon.normalContrast;
+            mon.currentBrightness = mon.normalBrightness;
+            mon.currentContrast   = mon.normalContrast;
+            mon.fadeState         = FadeState::Idle;
+
+            if (mon.hPhysical) {
+                if (mon.ddcSupported)
+                    DdcInterface::SetBrightness(mon.hPhysical, mon.normalBrightness);
+                if (mon.contrastSupported)
+                    DdcInterface::SetContrast(mon.hPhysical, mon.normalContrast);
+                Logger::Info("Applied ceiling to %ls: brightness=%lu contrast=%lu",
+                             mon.deviceName.c_str(),
+                             mon.normalBrightness, mon.normalContrast);
+            }
+        }
+    }
+    if (m_workerWakeEvent) SetEvent(m_workerWakeEvent.get());
+}
+
+bool MonitorManager::PollForCeilingBump() {
+    AppConfig cfgCopy;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_config.enabled) return false;
+
+        for (auto& mon : m_monitors) {
+            if (!mon.hPhysical || !mon.isActive) continue;
+            if (mon.fadeState != FadeState::Idle) continue;
+
+            if (mon.ddcSupported) {
+                auto info = DdcInterface::GetBrightness(mon.hPhysical);
+                if (info.supported) {
+                    if (info.current > mon.normalBrightness) {
+                        DWORD range = mon.brightnessMax - mon.brightnessMin;
+                        if (range > 0) {
+                            int pct = static_cast<int>(std::round(
+                                100.0 * (info.current - mon.brightnessMin) / range));
+                            if (pct > m_config.maxBrightnessPercent) {
+                                Logger::Info("User raised brightness on %ls to %lu — bumping ceiling %d%% -> %d%%",
+                                             mon.deviceName.c_str(), info.current,
+                                             m_config.maxBrightnessPercent, pct);
+                                m_config.maxBrightnessPercent = std::clamp(pct, 0, 100);
+                                changed = true;
+                            }
+                        }
+                        mon.currentBrightness = info.current;
+                    } else if (info.current < mon.normalBrightness) {
+                        // Hardware drifted below the ceiling on the active
+                        // monitor (DPMS wake, OSD adjustment, silently-dropped
+                        // DDC write). Sync the cache and force the worker to
+                        // push back up to the target.
+                        Logger::Info("Brightness drift on %ls: hw=%lu cache=%lu — forcing re-write",
+                                     mon.deviceName.c_str(),
+                                     info.current, mon.currentBrightness);
+                        mon.currentBrightness = info.current;
+                        mon.forceWrite = true;
+                    }
+                }
+            }
+
+            if (mon.contrastSupported) {
+                auto info = DdcInterface::GetContrast(mon.hPhysical);
+                if (info.supported) {
+                    if (info.current > mon.normalContrast) {
+                        DWORD range = mon.contrastMax - mon.contrastMin;
+                        if (range > 0) {
+                            int pct = static_cast<int>(std::round(
+                                100.0 * (info.current - mon.contrastMin) / range));
+                            if (pct > m_config.maxContrastPercent) {
+                                Logger::Info("User raised contrast on %ls to %lu — bumping ceiling %d%% -> %d%%",
+                                             mon.deviceName.c_str(), info.current,
+                                             m_config.maxContrastPercent, pct);
+                                m_config.maxContrastPercent = std::clamp(pct, 0, 100);
+                                changed = true;
+                            }
+                        }
+                        mon.currentContrast = info.current;
+                    } else if (info.current < mon.normalContrast) {
+                        Logger::Info("Contrast drift on %ls: hw=%lu cache=%lu — forcing re-write",
+                                     mon.deviceName.c_str(),
+                                     info.current, mon.currentContrast);
+                        mon.currentContrast = info.current;
+                        mon.forceWrite = true;
+                    }
+                }
+            }
+        }
+
+        if (changed) {
+            for (auto& mon : m_monitors) RecomputeDimFloors(mon);
+            cfgCopy = m_config;
+        }
+    }
+
+    if (changed && m_onConfigChanged) {
+        m_onConfigChanged(cfgCopy);
+    }
+    return changed;
 }
 
 void MonitorManager::StartWorker() {
@@ -268,15 +524,15 @@ void MonitorManager::Shutdown() {
 
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    // Restore original brightness and contrast
+    // Set all monitors to their saved ceiling values on exit.
     for (auto& mon : m_monitors) {
         if (mon.hPhysical) {
             if (mon.ddcSupported)
-                DdcInterface::SetBrightness(mon.hPhysical, mon.originalBrightness);
+                DdcInterface::SetBrightness(mon.hPhysical, mon.normalBrightness);
             if (mon.contrastSupported)
-                DdcInterface::SetContrast(mon.hPhysical, mon.originalContrast);
-            Logger::Info("Restored monitor %ls to original brightness=%lu contrast=%lu on exit",
-                         mon.deviceName.c_str(), mon.originalBrightness, mon.originalContrast);
+                DdcInterface::SetContrast(mon.hPhysical, mon.normalContrast);
+            Logger::Info("Set monitor %ls to ceiling brightness=%lu contrast=%lu on exit",
+                         mon.deviceName.c_str(), mon.normalBrightness, mon.normalContrast);
         }
     }
 
@@ -285,6 +541,175 @@ void MonitorManager::Shutdown() {
     m_physicalHandles.clear();
 
     Logger::Info("MonitorManager shutdown complete");
+}
+
+// ---------------------------------------------------------------------------
+// Topology validation (watchdog)
+// ---------------------------------------------------------------------------
+
+void MonitorManager::ValidateTopology() {
+    // Snapshot what we currently believe.
+    struct Snapshot { HMONITOR h; RECT bounds; };
+    std::vector<Snapshot> known;
+    HMONITOR believedActive = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        believedActive = m_activeMonitor;
+        for (auto& m : m_monitors)
+            known.push_back({m.hLogical, m.bounds});
+    }
+
+    // Re-enumerate desktop monitors and compare against our cache.
+    struct EnumItem { HMONITOR h; RECT bounds; };
+    std::vector<EnumItem> live;
+    EnumDisplayMonitors(nullptr, nullptr,
+        [](HMONITOR h, HDC, LPRECT, LPARAM lp) -> BOOL {
+            MONITORINFO mi = {}; mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(h, &mi)) {
+                reinterpret_cast<std::vector<EnumItem>*>(lp)->push_back({h, mi.rcMonitor});
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&live));
+
+    bool topologyChanged = (live.size() != known.size());
+    if (!topologyChanged) {
+        for (size_t i = 0; i < live.size() && !topologyChanged; ++i) {
+            bool found = false;
+            for (auto& k : known) {
+                if (k.h == live[i].h &&
+                    k.bounds.left   == live[i].bounds.left  &&
+                    k.bounds.top    == live[i].bounds.top   &&
+                    k.bounds.right  == live[i].bounds.right &&
+                    k.bounds.bottom == live[i].bounds.bottom) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) topologyChanged = true;
+        }
+    }
+
+    if (topologyChanged) {
+        Logger::Warn("Topology change detected, re-enumerating monitors");
+        EnumerateMonitors();
+        ApplyCeilings();
+        return;
+    }
+
+    // Reconcile active monitor against the current cursor position in case
+    // the mouse hook missed a transition.
+    POINT pt;
+    if (!GetCursorPos(&pt)) return;
+    HMONITOR hCursor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if (hCursor && hCursor != believedActive) {
+        Logger::Info("Watchdog detected stale active monitor; reconciling to %p", hCursor);
+        OnMonitorActivated(hCursor);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full-screen media detection
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct FullscreenScanEntry {
+    HMONITOR hLogical;
+    RECT     bounds;
+    bool     covered;
+};
+
+bool IsShellOrOverlayWindow(HWND hwnd) {
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, static_cast<int>(_countof(cls)));
+    return _wcsicmp(cls, L"Progman") == 0 ||
+           _wcsicmp(cls, L"WorkerW") == 0 ||
+           _wcsicmp(cls, kOverlayClass) == 0;
+}
+
+BOOL CALLBACK FullscreenEnumProc(HWND hwnd, LPARAM lp) {
+    auto* entries = reinterpret_cast<std::vector<FullscreenScanEntry>*>(lp);
+
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+    if (IsShellOrOverlayWindow(hwnd)) return TRUE;
+
+    // Skip DWM-cloaked windows (suspended UWP apps report as visible).
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED,
+                                        &cloaked, sizeof(cloaked))) && cloaked)
+        return TRUE;
+
+    RECT wr;
+    if (!GetWindowRect(hwnd, &wr)) return TRUE;
+
+    for (auto& e : *entries) {
+        if (!e.covered &&
+            wr.left  <= e.bounds.left  && wr.top    <= e.bounds.top &&
+            wr.right >= e.bounds.right && wr.bottom >= e.bounds.bottom) {
+            e.covered = true;
+        }
+    }
+    return TRUE;
+}
+
+} // namespace
+
+void MonitorManager::UpdateFullscreenMediaFlags() {
+    std::vector<FullscreenScanEntry> entries;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_config.enabled) {
+            for (auto& mon : m_monitors) mon.hasFullscreenMedia = false;
+            return;
+        }
+        for (auto& mon : m_monitors)
+            entries.push_back({mon.hLogical, mon.bounds, false});
+    }
+    if (entries.empty()) return;
+
+    // "Media playing" = some app is holding the display awake. Video players
+    // and browsers set ES_DISPLAY_REQUIRED during playback; a full-screen
+    // window alone (e.g. a paused editor in fullscreen) does not count. If
+    // the query fails we err toward not dimming full-screen windows.
+    ULONG execState = 0;
+    bool displayRequired = true;
+    if (CallNtPowerInformation(SystemExecutionState, nullptr, 0,
+                               &execState, sizeof(execState)) == 0) {
+        displayRequired = (execState & ES_DISPLAY_REQUIRED) != 0;
+    }
+
+    if (displayRequired) {
+        EnumWindows(FullscreenEnumProc, reinterpret_cast<LPARAM>(&entries));
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& mon : m_monitors) {
+        for (auto& e : entries) {
+            if (e.hLogical != mon.hLogical) continue;
+
+            bool flag = displayRequired && e.covered;
+            if (flag != mon.hasFullscreenMedia) {
+                Logger::Info("Full-screen media %s on %ls",
+                             flag ? "detected" : "ended", mon.deviceName.c_str());
+                if (!flag) {
+                    if (mon.isActive) {
+                        // Media ended on the cursor monitor — restart the
+                        // mouse-idle window instead of fading immediately.
+                        m_lastMouseActivityTick.store(GetTickCount64(),
+                                                      std::memory_order_relaxed);
+                    } else if (mon.fadeState == FadeState::Idle ||
+                               mon.fadeState == FadeState::FadingIn) {
+                        // Media ended on an inactive monitor: begin the
+                        // normal idle countdown.
+                        mon.fadeState = FadeState::Waiting;
+                        mon.idleStart = std::chrono::steady_clock::now();
+                    }
+                }
+            }
+            mon.hasFullscreenMedia = flag;
+            break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +727,33 @@ void MonitorManager::WorkerLoop() {
         WaitForSingleObject(m_workerWakeEvent.get(), interval);
         if (!m_workerRunning) break;
 
+        // Periodically (~2s) refresh full-screen media flags before advancing
+        // fades so a newly started video suppresses dimming promptly.
+        {
+            auto tick = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    tick - m_lastFullscreenCheck).count() >= 2000) {
+                m_lastFullscreenCheck = tick;
+                UpdateFullscreenMediaFlags();
+            }
+        }
+
         UpdateMonitors();
+
+        // Periodically (~5s) poll active monitor for user-driven ceiling bumps.
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - m_lastCeilingPoll).count() >= 5000) {
+            m_lastCeilingPoll = now;
+            PollForCeilingBump();
+        }
+
+        // Periodically (~2s) run the topology / active-monitor watchdog.
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - m_lastTopologyCheck).count() >= 2000) {
+            m_lastTopologyCheck = now;
+            ValidateTopology();
+        }
     }
 }
 
@@ -317,8 +768,57 @@ void MonitorManager::UpdateMonitors() {
 
     auto now = std::chrono::steady_clock::now();
 
+    // Pick up keyboard activity handed off by the hook thread. It counts as
+    // activity on the monitor hosting the focused window.
+    ULONGLONG kbTick = m_lastKeyboardActivityTick.load(std::memory_order_relaxed);
+    HMONITOR kbMon = m_lastKeyboardMonitor.load(std::memory_order_relaxed);
+    bool kbFresh = (kbTick != 0 && kbTick != m_processedKeyboardTick);
+    if (kbFresh) m_processedKeyboardTick = kbTick;
+
     for (auto& mon : m_monitors) {
         // --- State transitions ---
+        if (kbFresh && m_config.enabled && mon.hLogical == kbMon) {
+            // Keyboard input in a window on this monitor counts as mouse
+            // activity here: keep it awake and reverse any fade in progress.
+            if (mon.isActive) {
+                m_lastMouseActivityTick.store(kbTick, std::memory_order_relaxed);
+            }
+            if (mon.fadeState == FadeState::Waiting) {
+                mon.idleStart = now;
+            } else if (mon.fadeState == FadeState::FadingOut ||
+                       mon.fadeState == FadeState::Dimmed) {
+                mon.fadeState = FadeState::FadingIn;
+                mon.fadeStartTime = now;
+                mon.fadeBrightnessAtStart = static_cast<double>(mon.currentBrightness);
+                mon.fadeContrastAtStart    = static_cast<double>(mon.currentContrast);
+                mon.targetBrightness = mon.normalBrightness;
+                mon.targetContrast   = mon.normalContrast;
+                mon.forceWrite = true;
+                if (mon.isActive) m_activeIdleFaded = false;
+                Logger::Info("Keyboard activity on %ls — restoring brightness",
+                             mon.deviceName.c_str());
+            }
+        }
+
+        if (mon.hasFullscreenMedia && m_config.enabled) {
+            // Full-screen media playing on this monitor: never begin fading,
+            // and restore it if a fade already started.
+            if (mon.fadeState == FadeState::Waiting) {
+                mon.idleStart = now;
+            } else if (mon.fadeState == FadeState::FadingOut ||
+                       mon.fadeState == FadeState::Dimmed) {
+                mon.fadeState = FadeState::FadingIn;
+                mon.fadeStartTime = now;
+                mon.fadeBrightnessAtStart = static_cast<double>(mon.currentBrightness);
+                mon.fadeContrastAtStart    = static_cast<double>(mon.currentContrast);
+                mon.targetBrightness = mon.normalBrightness;
+                mon.targetContrast   = mon.normalContrast;
+                if (mon.isActive) m_activeIdleFaded = false;
+                Logger::Info("Full-screen media on %ls — restoring brightness",
+                             mon.deviceName.c_str());
+            }
+        }
+
         if (mon.fadeState == FadeState::Waiting && m_config.enabled) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - mon.idleStart).count();
@@ -329,6 +829,26 @@ void MonitorManager::UpdateMonitors() {
                 mon.fadeContrastAtStart    = static_cast<double>(mon.currentContrast);
                 mon.targetBrightness = mon.dimFloorBrightness;
                 mon.targetContrast   = mon.dimFloorContrast;
+            }
+        }
+
+        // Mouse-idle fade: the active monitor (the one holding the cursor)
+        // also fades once the mouse has been still for the configured time.
+        if (m_config.enabled && mon.isActive &&
+            mon.fadeState == FadeState::Idle &&
+            m_config.mouseIdleFadeMinutes > 0 && !mon.hasFullscreenMedia) {
+            ULONGLONG idleMs = GetTickCount64() -
+                m_lastMouseActivityTick.load(std::memory_order_relaxed);
+            if (idleMs >= static_cast<ULONGLONG>(m_config.mouseIdleFadeMinutes) * 60000ULL) {
+                mon.fadeState = FadeState::FadingOut;
+                mon.fadeStartTime = now;
+                mon.fadeBrightnessAtStart = static_cast<double>(mon.currentBrightness);
+                mon.fadeContrastAtStart    = static_cast<double>(mon.currentContrast);
+                mon.targetBrightness = mon.dimFloorBrightness;
+                mon.targetContrast   = mon.dimFloorContrast;
+                m_activeIdleFaded = true;
+                Logger::Info("No mouse movement for %d min — fading active monitor %ls",
+                             m_config.mouseIdleFadeMinutes, mon.deviceName.c_str());
             }
         }
 
@@ -378,7 +898,15 @@ void MonitorManager::UpdateMonitors() {
                     (static_cast<double>(mon.normalContrast) - mon.fadeContrastAtStart) * t));
 
             if (t >= 1.0) {
-                mon.fadeState = FadeState::Idle;
+                if (mon.isActive) {
+                    mon.fadeState = FadeState::Idle;
+                } else {
+                    // Restored while inactive (keyboard activity or media on
+                    // a non-cursor monitor): resume the idle countdown so it
+                    // dims again once the activity stops.
+                    mon.fadeState = FadeState::Waiting;
+                    mon.idleStart = now;
+                }
             }
         } else if (mon.fadeState == FadeState::Idle) {
             desiredB = mon.targetBrightness;
@@ -394,16 +922,21 @@ void MonitorManager::UpdateMonitors() {
 
         bool brightnessChanged = (desiredB != mon.currentBrightness);
         bool contrastChanged   = (desiredC != mon.currentContrast);
+        bool force             = mon.forceWrite;
 
-        if (!brightnessChanged && !contrastChanged) continue;
+        if (!brightnessChanged && !contrastChanged && !force) continue;
 
-        // Per-monitor throttle: min 50ms between commands
+        // Per-monitor throttle: min 50ms between commands. Force writes
+        // bypass the throttle so click / wake / drift recovery is immediate.
         auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - mon.lastCommandTime).count();
-        if (sinceLast < 50) continue;
+        if (sinceLast < 50 && !force) continue;
+
+        bool brightnessWrite = brightnessChanged || force;
+        bool contrastWrite   = contrastChanged   || force;
 
         // --- Write via DDC/CI ---
-        if (mon.ddcSupported && mon.hPhysical && brightnessChanged) {
+        if (mon.ddcSupported && mon.hPhysical && brightnessWrite) {
             bool ok = DdcInterface::SetBrightness(mon.hPhysical, desiredB);
             if (ok) {
                 mon.currentBrightness = desiredB;
@@ -420,11 +953,12 @@ void MonitorManager::UpdateMonitors() {
             mon.lastCommandTime = now;
         }
 
-        if (mon.contrastSupported && mon.hPhysical && contrastChanged) {
-            // Extra throttle check after brightness write
+        if (mon.contrastSupported && mon.hPhysical && contrastWrite) {
+            // Extra throttle check after brightness write — also bypassed
+            // for force writes so a click pushes both values in one tick.
             auto sinceLast2 = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - mon.lastCommandTime).count();
-            if (sinceLast2 >= 50) {
+            if (sinceLast2 >= 50 || force) {
                 bool ok = DdcInterface::SetContrast(mon.hPhysical, desiredC);
                 if (ok) {
                     mon.currentContrast = desiredC;
@@ -438,7 +972,7 @@ void MonitorManager::UpdateMonitors() {
         }
 
         // Software overlay fallback (brightness only — contrast not applicable)
-        if (mon.useSoftwareFallback && brightnessChanged) {
+        if (mon.useSoftwareFallback && brightnessWrite) {
             mon.currentBrightness = desiredB;
             bool found = false;
             for (auto& ov : m_overlays) {
@@ -448,6 +982,8 @@ void MonitorManager::UpdateMonitors() {
             UpdateOverlay(mon);
             mon.lastCommandTime = now;
         }
+
+        mon.forceWrite = false;
     }
 }
 

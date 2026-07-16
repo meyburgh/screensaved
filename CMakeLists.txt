@@ -28,6 +28,8 @@ target_link_libraries(ScreenSaved PRIVATE
     comctl32
     ole32
     advapi32
+    dwmapi
+    powrprof
 )
 
 # Manifest is embedded via app.rc — disable CMake's auto-generated one

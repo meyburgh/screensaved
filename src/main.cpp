@@ -20,6 +20,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     MonitorManager monitorMgr;
     monitorMgr.SetConfig(config);
     monitorMgr.EnumerateMonitors();
+    monitorMgr.ApplyCeilings();
+
+    // Persist ceiling changes detected at runtime by the worker.
+    monitorMgr.SetOnConfigChanged([](const AppConfig& cfg) {
+        ConfigStore::Save(cfg);
+    });
+
     monitorMgr.StartWorker();
 
     // Create input hook
@@ -49,6 +56,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         monitorMgr.SetConfig(cfg);
         monitorMgr.SetEnabled(cfg.enabled);
         ConfigStore::Save(cfg);
+        monitorMgr.ApplyCeilings();
         Logger::Info("Settings saved from dialog");
     };
 
@@ -56,7 +64,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return monitorMgr.GetConfig();
     };
 
-    if (!tray.Init(hInstance, onToggle, onExit, onSettingsSave, getConfig)) {
+    auto onDisplayWake = [&]() {
+        monitorMgr.OnDisplayWake();
+    };
+
+    auto onDisplayChange = [&]() {
+        monitorMgr.OnDisplayChanged();
+    };
+
+    if (!tray.Init(hInstance, onToggle, onExit, onSettingsSave, getConfig,
+                   onDisplayWake, onDisplayChange)) {
         Logger::Error("Failed to initialize tray UI");
         monitorMgr.Shutdown();
         Logger::Shutdown();

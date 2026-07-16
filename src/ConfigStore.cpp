@@ -71,9 +71,12 @@ AppConfig Load() {
     cfg.idleTimeoutMs               = ReadInt(path, L"IdleTimeoutMs",               cfg.idleTimeoutMs);
     cfg.dimBrightnessPercent        = ReadInt(path, L"DimBrightnessPercent",        cfg.dimBrightnessPercent);
     cfg.dimContrastPercent          = ReadInt(path, L"DimContrastPercent",          cfg.dimContrastPercent);
+    cfg.maxBrightnessPercent        = ReadInt(path, L"MaxBrightnessPercent",        cfg.maxBrightnessPercent);
+    cfg.maxContrastPercent          = ReadInt(path, L"MaxContrastPercent",          cfg.maxContrastPercent);
     cfg.brightnessFadeOutDurationMs = ReadInt(path, L"BrightnessFadeOutDurationMs", cfg.brightnessFadeOutDurationMs);
     cfg.contrastFadeOutDurationMs   = ReadInt(path, L"ContrastFadeOutDurationMs",   cfg.contrastFadeOutDurationMs);
     cfg.fadeInDurationMs            = ReadInt(path, L"FadeInDurationMs",            cfg.fadeInDurationMs);
+    cfg.mouseIdleFadeMinutes        = ReadInt(path, L"MouseIdleFadeMinutes",        cfg.mouseIdleFadeMinutes);
     cfg.workerIntervalMs            = ReadInt(path, L"WorkerIntervalMs",            cfg.workerIntervalMs);
     cfg.enabled                     = ReadInt(path, L"Enabled",                     cfg.enabled ? 1 : 0) != 0;
     cfg.startWithWindows            = ReadInt(path, L"StartWithWindows",            cfg.startWithWindows ? 1 : 0) != 0;
@@ -84,7 +87,16 @@ AppConfig Load() {
     if (cfg.dimBrightnessPercent > 100) cfg.dimBrightnessPercent = 100;
     if (cfg.dimContrastPercent < 0)     cfg.dimContrastPercent = 0;
     if (cfg.dimContrastPercent > 100)   cfg.dimContrastPercent = 100;
+    if (cfg.maxBrightnessPercent < 0)   cfg.maxBrightnessPercent = 0;
+    if (cfg.maxBrightnessPercent > 100) cfg.maxBrightnessPercent = 100;
+    if (cfg.maxContrastPercent < 0)     cfg.maxContrastPercent = 0;
+    if (cfg.maxContrastPercent > 100)   cfg.maxContrastPercent = 100;
+    if (cfg.dimBrightnessPercent > cfg.maxBrightnessPercent)
+        cfg.dimBrightnessPercent = cfg.maxBrightnessPercent;
+    if (cfg.dimContrastPercent > cfg.maxContrastPercent)
+        cfg.dimContrastPercent = cfg.maxContrastPercent;
     if (cfg.idleTimeoutMs < 500)        cfg.idleTimeoutMs = 500;
+    if (cfg.mouseIdleFadeMinutes < 0)   cfg.mouseIdleFadeMinutes = 0;
     if (cfg.workerIntervalMs < 50)      cfg.workerIntervalMs = 50;
 
     Logger::Info("Config loaded from %ls: idle=%dms dimB=%d%% dimC=%d%% enabled=%d startup=%d",
@@ -101,13 +113,17 @@ void Save(const AppConfig& cfg) {
     WriteInt(path, L"IdleTimeoutMs",               cfg.idleTimeoutMs);
     WriteInt(path, L"DimBrightnessPercent",        cfg.dimBrightnessPercent);
     WriteInt(path, L"DimContrastPercent",           cfg.dimContrastPercent);
+    WriteInt(path, L"MaxBrightnessPercent",         cfg.maxBrightnessPercent);
+    WriteInt(path, L"MaxContrastPercent",           cfg.maxContrastPercent);
     WriteInt(path, L"BrightnessFadeOutDurationMs",  cfg.brightnessFadeOutDurationMs);
     WriteInt(path, L"ContrastFadeOutDurationMs",    cfg.contrastFadeOutDurationMs);
     WriteInt(path, L"FadeInDurationMs",             cfg.fadeInDurationMs);
+    WriteInt(path, L"MouseIdleFadeMinutes",         cfg.mouseIdleFadeMinutes);
     WriteInt(path, L"WorkerIntervalMs",             cfg.workerIntervalMs);
     WriteInt(path, L"Enabled",                      cfg.enabled ? 1 : 0);
     WriteInt(path, L"StartWithWindows",             cfg.startWithWindows ? 1 : 0);
     WriteInt(path, L"StartupPromptShown",           cfg.startupPromptShown ? 1 : 0);
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
 
     Logger::Info("Config saved to %ls", path.c_str());
 }

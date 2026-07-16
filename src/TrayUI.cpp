@@ -8,6 +8,12 @@
 
 #pragma comment(lib, "comctl32.lib")
 
+// GUID_MONITOR_POWER_ON, defined locally to avoid <initguid.h> include-order
+// requirements. Notifies on monitor power transitions: Data byte 0 is
+// 0=off, 1=on, 2=dimmed (Win10+).
+static const GUID kGuidMonitorPowerOn =
+    { 0x02731015, 0x4510, 0x4526, { 0x99, 0xE6, 0xE5, 0xA1, 0x7E, 0xBD, 0x1A, 0xEA } };
+
 TrayUI* TrayUI::s_instance = nullptr;
 
 // ---------------------------------------------------------------------------
@@ -84,6 +90,9 @@ enum {
     IDC_B_FADE_OUT          = 2020,
     IDC_C_FADE_OUT          = 2022,
     IDC_FADE_IN             = 2024,
+    IDC_BRIGHTNESS_CEILING  = 2026,
+    IDC_CONTRAST_CEILING    = 2028,
+    IDC_MOUSE_IDLE_FADE     = 2030,
 };
 
 // ---------------------------------------------------------------------------
@@ -110,6 +119,71 @@ static HWND CreateLabelEdit(HWND parent, HINSTANCE hInst, HFONT hFont,
 // Settings dialog proc
 // ---------------------------------------------------------------------------
 
+bool TrayUI::PersistSettingsFromDialog(HWND hwnd) {
+    if (!s_instance) return false;
+
+    AppConfig cfg = s_instance->m_getConfig ? s_instance->m_getConfig() : AppConfig{};
+
+    BOOL ok = FALSE;
+    int val;
+
+    val = GetDlgItemInt(hwnd, IDC_IDLE_TIMEOUT, &ok, FALSE);
+    if (ok && val >= 1) cfg.idleTimeoutMs = val * 1000;
+
+    val = GetDlgItemInt(hwnd, IDC_BRIGHTNESS_FLOOR, &ok, FALSE);
+    if (ok && val >= 0 && val <= 100) cfg.dimBrightnessPercent = val;
+
+    val = GetDlgItemInt(hwnd, IDC_CONTRAST_FLOOR, &ok, FALSE);
+    if (ok && val >= 0 && val <= 100) cfg.dimContrastPercent = val;
+
+    val = GetDlgItemInt(hwnd, IDC_BRIGHTNESS_CEILING, &ok, FALSE);
+    if (ok && val >= 0 && val <= 100) cfg.maxBrightnessPercent = val;
+
+    val = GetDlgItemInt(hwnd, IDC_CONTRAST_CEILING, &ok, FALSE);
+    if (ok && val >= 0 && val <= 100) cfg.maxContrastPercent = val;
+
+    if (cfg.dimBrightnessPercent > cfg.maxBrightnessPercent) {
+        MessageBoxW(hwnd,
+                    L"Brightness floor cannot be greater than brightness ceiling.",
+                    L"ScreenSaved Settings",
+                    MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    if (cfg.dimContrastPercent > cfg.maxContrastPercent) {
+        MessageBoxW(hwnd,
+                    L"Contrast floor cannot be greater than contrast ceiling.",
+                    L"ScreenSaved Settings",
+                    MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    val = GetDlgItemInt(hwnd, IDC_B_FADE_OUT, &ok, FALSE);
+    if (ok && val >= 0) cfg.brightnessFadeOutDurationMs = val * 1000;
+
+    val = GetDlgItemInt(hwnd, IDC_C_FADE_OUT, &ok, FALSE);
+    if (ok && val >= 0) cfg.contrastFadeOutDurationMs = val * 1000;
+
+    val = GetDlgItemInt(hwnd, IDC_FADE_IN, &ok, FALSE);
+    if (ok && val >= 0) cfg.fadeInDurationMs = val;
+
+    val = GetDlgItemInt(hwnd, IDC_MOUSE_IDLE_FADE, &ok, FALSE);
+    if (ok && val >= 0) cfg.mouseIdleFadeMinutes = val;
+
+    cfg.enabled = (IsDlgButtonChecked(hwnd, IDC_ENABLED_CHECK) == BST_CHECKED);
+
+    bool wantStartup = (IsDlgButtonChecked(hwnd, IDC_STARTUP_CHECK) == BST_CHECKED);
+    cfg.startWithWindows = wantStartup;
+    ConfigStore::SetStartWithWindows(wantStartup);
+
+    if (s_instance->m_onSettingsSave) {
+        s_instance->m_onSettingsSave(cfg);
+    }
+
+    s_instance->SetEnabled(cfg.enabled);
+    return true;
+}
+
 INT_PTR CALLBACK TrayUI::SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_INITDIALOG: {
@@ -119,9 +193,12 @@ INT_PTR CALLBACK TrayUI::SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         SetDlgItemInt(hwnd, IDC_IDLE_TIMEOUT, cfg.idleTimeoutMs / 1000, FALSE);
         SetDlgItemInt(hwnd, IDC_BRIGHTNESS_FLOOR, cfg.dimBrightnessPercent, FALSE);
         SetDlgItemInt(hwnd, IDC_CONTRAST_FLOOR, cfg.dimContrastPercent, FALSE);
+        SetDlgItemInt(hwnd, IDC_BRIGHTNESS_CEILING, cfg.maxBrightnessPercent, FALSE);
+        SetDlgItemInt(hwnd, IDC_CONTRAST_CEILING, cfg.maxContrastPercent, FALSE);
         SetDlgItemInt(hwnd, IDC_B_FADE_OUT, cfg.brightnessFadeOutDurationMs / 1000, FALSE);
         SetDlgItemInt(hwnd, IDC_C_FADE_OUT, cfg.contrastFadeOutDurationMs / 1000, FALSE);
         SetDlgItemInt(hwnd, IDC_FADE_IN, cfg.fadeInDurationMs, FALSE);
+        SetDlgItemInt(hwnd, IDC_MOUSE_IDLE_FADE, cfg.mouseIdleFadeMinutes, FALSE);
         CheckDlgButton(hwnd, IDC_ENABLED_CHECK, cfg.enabled ? BST_CHECKED : BST_UNCHECKED);
 
         // Startup checkbox reflects actual registry state
@@ -143,42 +220,7 @@ INT_PTR CALLBACK TrayUI::SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDC_OK_BTN: {
-            if (!s_instance) break;
-            AppConfig cfg = s_instance->m_getConfig ? s_instance->m_getConfig() : AppConfig{};
-
-            BOOL ok = FALSE;
-            int val;
-
-            val = GetDlgItemInt(hwnd, IDC_IDLE_TIMEOUT, &ok, FALSE);
-            if (ok && val >= 1) cfg.idleTimeoutMs = val * 1000;
-
-            val = GetDlgItemInt(hwnd, IDC_BRIGHTNESS_FLOOR, &ok, FALSE);
-            if (ok && val >= 0 && val <= 100) cfg.dimBrightnessPercent = val;
-
-            val = GetDlgItemInt(hwnd, IDC_CONTRAST_FLOOR, &ok, FALSE);
-            if (ok && val >= 0 && val <= 100) cfg.dimContrastPercent = val;
-
-            val = GetDlgItemInt(hwnd, IDC_B_FADE_OUT, &ok, FALSE);
-            if (ok && val >= 0) cfg.brightnessFadeOutDurationMs = val * 1000;
-
-            val = GetDlgItemInt(hwnd, IDC_C_FADE_OUT, &ok, FALSE);
-            if (ok && val >= 0) cfg.contrastFadeOutDurationMs = val * 1000;
-
-            val = GetDlgItemInt(hwnd, IDC_FADE_IN, &ok, FALSE);
-            if (ok && val >= 0) cfg.fadeInDurationMs = val;
-
-            cfg.enabled = (IsDlgButtonChecked(hwnd, IDC_ENABLED_CHECK) == BST_CHECKED);
-
-            // Handle startup registration
-            bool wantStartup = (IsDlgButtonChecked(hwnd, IDC_STARTUP_CHECK) == BST_CHECKED);
-            cfg.startWithWindows = wantStartup;
-            ConfigStore::SetStartWithWindows(wantStartup);
-
-            if (s_instance->m_onSettingsSave) {
-                s_instance->m_onSettingsSave(cfg);
-            }
-
-            s_instance->SetEnabled(cfg.enabled);
+            if (!PersistSettingsFromDialog(hwnd)) return TRUE;
             DestroyWindow(hwnd);
             s_instance->m_settingsDlg = nullptr;
             Logger::Info("Settings dialog confirmed");
@@ -186,15 +228,19 @@ INT_PTR CALLBACK TrayUI::SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         }
         case IDC_CANCEL_BTN:
         case IDCANCEL:
+            if (!PersistSettingsFromDialog(hwnd)) return TRUE;
             DestroyWindow(hwnd);
             if (s_instance) s_instance->m_settingsDlg = nullptr;
+            Logger::Info("Settings dialog closed");
             return TRUE;
         }
         break;
 
     case WM_CLOSE:
+        if (!PersistSettingsFromDialog(hwnd)) return TRUE;
         DestroyWindow(hwnd);
         if (s_instance) s_instance->m_settingsDlg = nullptr;
+        Logger::Info("Settings dialog closed");
         return TRUE;
     }
     return FALSE;
@@ -214,7 +260,7 @@ void TrayUI::ShowSettingsDialog() {
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LINK_CLASS };
     InitCommonControlsEx(&icc);
 
-    const int dlgW = 380, dlgH = 440;
+    const int dlgW = 380, dlgH = 540;
     const int margin = 12;
     const int labelW = 190, editW = 80, editH = 22;
     const int rowH = 28;
@@ -270,6 +316,11 @@ void TrayUI::ShowSettingsDialog() {
     CreateLabelEdit(dlg, m_hInst, hFont,
         L"Fade-in duration (ms):", IDC_FADE_IN,
         margin, y, labelW, editW, editH);
+    y += rowH;
+
+    CreateLabelEdit(dlg, m_hInst, hFont,
+        L"Mouse idle fade (minutes, 0 = off):", IDC_MOUSE_IDLE_FADE,
+        margin, y, labelW, editW, editH);
     y += rowH + 4;
 
     // --- Brightness section ---
@@ -282,6 +333,11 @@ void TrayUI::ShowSettingsDialog() {
 
     CreateLabelEdit(dlg, m_hInst, hFont,
         L"  Min floor (%):", IDC_BRIGHTNESS_FLOOR,
+        margin, y, labelW, editW, editH);
+    y += rowH;
+
+    CreateLabelEdit(dlg, m_hInst, hFont,
+        L"  Max ceiling (%):", IDC_BRIGHTNESS_CEILING,
         margin, y, labelW, editW, editH);
     y += rowH;
 
@@ -300,6 +356,11 @@ void TrayUI::ShowSettingsDialog() {
 
     CreateLabelEdit(dlg, m_hInst, hFont,
         L"  Min floor (%):", IDC_CONTRAST_FLOOR,
+        margin, y, labelW, editW, editH);
+    y += rowH;
+
+    CreateLabelEdit(dlg, m_hInst, hFont,
+        L"  Max ceiling (%):", IDC_CONTRAST_CEILING,
         margin, y, labelW, editW, editH);
     y += rowH;
 
@@ -367,12 +428,16 @@ bool TrayUI::Init(HINSTANCE hInst,
                    ToggleCallback onToggle,
                    ExitCallback onExit,
                    SettingsCallback onSettingsSave,
-                   GetConfigCallback getConfig) {
-    m_hInst          = hInst;
-    m_onToggle       = onToggle;
-    m_onExit         = onExit;
-    m_onSettingsSave = onSettingsSave;
-    m_getConfig      = getConfig;
+                   GetConfigCallback getConfig,
+                   DisplayWakeCallback onDisplayWake,
+                   DisplayChangeCallback onDisplayChange) {
+    m_hInst            = hInst;
+    m_onToggle         = onToggle;
+    m_onExit           = onExit;
+    m_onSettingsSave   = onSettingsSave;
+    m_getConfig        = getConfig;
+    m_onDisplayWake    = onDisplayWake;
+    m_onDisplayChange  = onDisplayChange;
 
     WNDCLASSEXW wc = {};
     wc.cbSize        = sizeof(wc);
@@ -402,6 +467,15 @@ bool TrayUI::Init(HINSTANCE hInst,
     Shell_NotifyIconW(NIM_ADD, &m_nid);
     Logger::Info("Tray icon added");
 
+    // Subscribe to monitor power transitions so we can re-push ceilings to
+    // hardware after DPMS wake (otherwise the cached state and HW desync).
+    m_powerNotify = RegisterPowerSettingNotification(
+        m_hwnd, &kGuidMonitorPowerOn, DEVICE_NOTIFY_WINDOW_HANDLE);
+    if (!m_powerNotify) {
+        Logger::Warn("RegisterPowerSettingNotification failed, error=%lu",
+                     GetLastError());
+    }
+
     return true;
 }
 
@@ -430,6 +504,10 @@ void TrayUI::Quit() {
 }
 
 void TrayUI::Shutdown() {
+    if (m_powerNotify) {
+        UnregisterPowerSettingNotification(m_powerNotify);
+        m_powerNotify = nullptr;
+    }
     if (m_settingsDlg) {
         DestroyWindow(m_settingsDlg);
         m_settingsDlg = nullptr;
@@ -482,6 +560,25 @@ LRESULT CALLBACK TrayUI::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_EXIT:
             if (s_instance->m_onExit) s_instance->m_onExit();
             break;
+        }
+        return 0;
+
+    case WM_POWERBROADCAST:
+        if (wp == PBT_POWERSETTINGCHANGE && lp) {
+            auto* pbs = reinterpret_cast<POWERBROADCAST_SETTING*>(lp);
+            if (pbs->PowerSetting == kGuidMonitorPowerOn &&
+                pbs->DataLength >= sizeof(DWORD)) {
+                DWORD state = *reinterpret_cast<const DWORD*>(pbs->Data);
+                if (state == 1 && s_instance->m_onDisplayWake) {
+                    s_instance->m_onDisplayWake();
+                }
+            }
+        }
+        return TRUE;
+
+    case WM_DISPLAYCHANGE:
+        if (s_instance->m_onDisplayChange) {
+            s_instance->m_onDisplayChange();
         }
         return 0;
 

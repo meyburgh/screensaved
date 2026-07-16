@@ -105,8 +105,19 @@ struct MonitorDevice {
     bool            useSoftwareFallback = false;
     int             failureCount    = 0;
 
+    // True while a full-screen window covers this monitor and an application
+    // is holding the display awake (ES_DISPLAY_REQUIRED) — i.e. full-screen
+    // media playback. Fading is suppressed while set.
+    bool            hasFullscreenMedia = false;
+
     // Last DDC command time (for per-monitor throttling)
     std::chrono::steady_clock::time_point lastCommandTime;
+
+    // When true, the worker pushes targetBrightness/targetContrast to hardware
+    // even if the cached current values already match. Used by clicks,
+    // activations, monitor-wake events, and downward-drift reconciliation —
+    // any path where the cache might lie about the real hardware state.
+    bool            forceWrite      = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -117,9 +128,12 @@ struct AppConfig {
     int     idleTimeoutMs               = 15000;    // 15 seconds default
     int     dimBrightnessPercent        = 5;        // dim to 5% of normal brightness
     int     dimContrastPercent          = 5;        // dim to 5% of normal contrast
+    int     maxBrightnessPercent        = 100;      // ceiling: % of monitor max brightness
+    int     maxContrastPercent          = 100;      // ceiling: % of monitor max contrast
     int     brightnessFadeOutDurationMs = 3000;     // brightness: 3 second fade-out
     int     contrastFadeOutDurationMs   = 3000;     // contrast: 3 second fade-out
     int     fadeInDurationMs            = 100;      // shared fade-in: 100ms default
+    int     mouseIdleFadeMinutes        = 5;        // fade active monitor after N minutes without mouse movement (0 = off)
     int     workerIntervalMs            = 100;      // worker wake interval
     bool    enabled                     = true;
     bool    startWithWindows            = false;
