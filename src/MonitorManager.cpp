@@ -724,7 +724,15 @@ void MonitorManager::WorkerLoop() {
             interval = static_cast<DWORD>(m_config.workerIntervalMs);
         }
 
-        WaitForSingleObject(m_workerWakeEvent.get(), interval);
+        // Overlay windows are created on this thread, so it must pump their
+        // messages or they never paint (and show nothing when dimmed).
+        HANDLE wake = m_workerWakeEvent.get();
+        MsgWaitForMultipleObjects(1, &wake, FALSE, interval, QS_ALLINPUT);
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
         if (!m_workerRunning) break;
 
         // Periodically (~2s) refresh full-screen media flags before advancing
@@ -998,6 +1006,7 @@ void MonitorManager::CreateOverlay(MonitorDevice& mon) {
         wc.lpfnWndProc   = OverlayWndProc;
         wc.hInstance      = GetModuleHandleW(nullptr);
         wc.lpszClassName  = kOverlayClass;
+        wc.hbrBackground  = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
         RegisterClassExW(&wc);
         m_overlayClassRegistered = true;
     }
