@@ -350,7 +350,9 @@ void MonitorManager::SetEnabled(bool enabled) {
             if (mon.useSoftwareFallback) {
                 for (auto& ov : m_overlays) {
                     if (ov.hMonitor == mon.hLogical && ov.hwnd)
-                        ShowWindow(ov.hwnd, SW_HIDE);
+                        // Async: the worker thread owns the overlay and may be
+                        // waiting on m_mutex, which we hold here.
+                        ShowWindowAsync(ov.hwnd, SW_HIDE);
                 }
             }
 
@@ -638,6 +640,13 @@ BOOL CALLBACK FullscreenEnumProc(HWND hwnd, LPARAM lp) {
     if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED,
                                         &cloaked, sizeof(cloaked))) && cloaked)
         return TRUE;
+
+    // A maximized or captioned window is not full-screen: maximized windows
+    // overhang the monitor by their invisible resize border and would
+    // otherwise match. Real full-screen players drop the caption.
+    if (IsZoomed(hwnd)) return TRUE;
+    LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    if ((style & WS_CAPTION) == WS_CAPTION) return TRUE;
 
     RECT wr;
     if (!GetWindowRect(hwnd, &wr)) return TRUE;
